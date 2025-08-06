@@ -5,7 +5,7 @@ defaults:
   - lightning_module: handwriting_module
 
 # Data settings
-data_location: ~/emg_data
+data_location: /capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/handwriting/
 task: handwriting
 
 # Train settings
@@ -19,7 +19,7 @@ num_nodes: 1
 
 trainer:
   max_epochs: 200
-  strategy: ddp
+  strategy: ddp_find_unused_parameters_false
   accelerator: auto
   gradient_clip_val: 0.1
   gradient_clip_algorithm: 'norm'

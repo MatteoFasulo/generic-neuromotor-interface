@@ -4,7 +4,7 @@ padding: [19014, 974]
 concatenate_prompts: true
 min_duration_s: 16.0
 
-num_workers: 0
+num_workers: 64
 
 transform:
   _target_: generic_neuromotor_interface.transforms.HandwritingTransform
