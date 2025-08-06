@@ -6,12 +6,13 @@
 
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
 from omegaconf import ListConfig
 from torch import nn
+from timm.layers import Mlp, SwiGLU
 
 
 class Permute(nn.Module):
@@ -171,6 +172,331 @@ class DiscreteGesturesArchitecture(nn.Module):
 
         # Layer normalization
         x = self.post_lstm_layer_norm(x)
+
+        # Feedforward projection layer
+        x = self.projection(x)
+        x = x.permute(0, 2, 1)
+
+        return x
+
+# https://docs.pytorch.org/torchtune/stable/_modules/torchtune/modules/position_embeddings.html#RotaryPositionalEmbeddings
+class RotaryPositionalEmbeddings(nn.Module):
+    """
+    This class implements Rotary Positional Embeddings (RoPE)
+    proposed in https://arxiv.org/abs/2104.09864.
+
+    Reference implementation (used for correctness verfication)
+    can be found here:
+    https://github.com/meta-llama/llama/blob/main/llama/model.py#L80
+
+    In this implementation we cache the embeddings for each position upto
+    ``max_seq_len`` by computing this during init.
+
+    Args:
+        dim (int): Embedding dimension. This is usually set to the dim of each
+            head in the attention module computed as ``embed_dim // num_heads``
+        max_seq_len (int): Maximum expected sequence length for the
+            model, if exceeded the cached freqs will be recomputed
+        base (int): The base for the geometric progression used to compute
+            the rotation angles
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_seq_len: int = 65536,
+        base: int = 10_000,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_seq_len = max_seq_len
+        self.rope_init()
+
+    def rope_init(self):
+        theta = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
+        )
+        self.register_buffer("theta", theta, persistent=False)
+        self.build_rope_cache(self.max_seq_len)
+
+    def build_rope_cache(self, max_seq_len: int = 65536) -> None:
+        # Create position indexes `[0, 1, ..., max_seq_len - 1]`
+        seq_idx = torch.arange(
+            max_seq_len, dtype=self.theta.dtype, device=self.theta.device
+        )
+
+        # Outer product of theta and position index; output tensor has
+        # a shape of [max_seq_len, dim // 2]
+        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float()
+
+        # cache includes both the cos and sin components and so the output shape is
+        # [max_seq_len, dim // 2, 2]
+        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        self.register_buffer("cache", cache, persistent=False)
+
+    def forward(
+        self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): input tensor with shape
+                ``[b, s, n_h, h_d]``
+            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
+                of each token. During training, this is used to indicate the positions
+                of each token relative to its sample when packed, shape [b, s].
+                During inference, this indicates the position of the current token.
+                If none, assume the index of the token is its position id. Default is None.
+
+        Returns:
+            torch.Tensor: output tensor with shape ``[b, s, n_h, h_d]``
+
+        Notation used for tensor shapes:
+            - b: batch size
+            - s: sequence length
+            - n_h: num heads
+            - h_d: head dim
+        """
+        # input tensor has shape [b, s, n_h, h_d]
+        seq_len = x.size(1)
+
+        # extract the values based on whether input_pos is set or not
+        rope_cache = (
+            self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
+        )
+
+        # reshape input; the last dimension is used for computing the output.
+        # Cast to float to match the reference implementation
+        # tensor has shape [b, s, n_h, h_d // 2, 2]
+        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+
+        # reshape the cache for broadcasting
+        # tensor has shape [b, s, 1, h_d // 2, 2] if packed samples,
+        # otherwise has shape [1, s, 1, h_d // 2, 2]
+        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
+
+        # tensor has shape [b, s, n_h, h_d // 2, 2]
+        x_out = torch.stack(
+            [
+                xshaped[..., 0] * rope_cache[..., 0]
+                - xshaped[..., 1] * rope_cache[..., 1],
+                xshaped[..., 1] * rope_cache[..., 0]
+                + xshaped[..., 0] * rope_cache[..., 1],
+            ],
+            -1,
+        )
+
+        # tensor has shape [b, s, n_h, h_d]
+        x_out = x_out.flatten(3)
+        return x_out.type_as(x)
+
+class MHA(nn.Module):
+    def __init__(
+        self, 
+        d_model, 
+        n_head,
+        dropout=0.1, 
+        batch_first=True,
+        qkv_bias: bool = True,
+        qk_norm: bool = True,
+        norm_layer: nn.Module = nn.RMSNorm,
+    ):
+        super().__init__()
+        assert d_model % n_head == 0, 'd_model should be divisible by n_head'
+        self.num_heads = n_head
+        self.head_dim = d_model // n_head
+        self.batch_first = batch_first
+
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(d_model, d_model)
+        self.proj_drop = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbeddings(dim=self.head_dim)
+
+    def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
+        B, N, D = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        # [B, H, N, h_d] to [b, s, n_h, h_d]
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+
+        # Apply RoPE
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # Permute back for scaled_dot_product_attention
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask, 
+            dropout_p=self.attn_drop.p if self.training else 0.,
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, D)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(
+        self, 
+        d_model, 
+        n_head, 
+        dim_feedforward, 
+        dropout, 
+        batch_first=True,
+        mlp_layer: nn.Module = SwiGLU,
+    ):
+        super().__init__()
+        self.self_attn = MHA(d_model, n_head, dropout, batch_first=batch_first)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.mlp = mlp_layer(
+            in_features=d_model,
+            hidden_features=dim_feedforward,
+            drop=dropout,
+        )
+
+    def forward(self, x: torch.Tensor, src_mask: Optional[torch.Tensor] = None, src_key_padding_mask: Optional[torch.Tensor] = None, is_causal: bool = False) -> torch.Tensor:
+        x = x + self.dropout1(self.self_attn(self.norm1(x), attn_mask=src_mask))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class TransformerDiscreteGesturesArchitecture(nn.Module):
+    """Discrete Gestures Network that combines ConvNet with Transformer
+    and projection layer.
+
+    Parameters
+    ----------
+    input_channels : int
+        Number of input channels for the ConvNet
+    conv_output_channels : int
+        Number of output channels from the ConvNet
+    kernel_width : int
+        Width of the convolutional kernels
+    stride : int
+        Stride of the convolutional layers
+    output_channels : int
+        Number of gestures to predict
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 16,
+        conv_output_channels: int = 192,
+        kernel_width: int = 21,
+        stride: int = 10,
+        embed_dim: int = 192,
+        num_layers: int = 8,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        output_channels: int = 9,
+    ) -> None:
+        super().__init__()
+
+        self.left_context = kernel_width - 1
+        self.stride = stride
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        assert embed_dim % num_heads == 0, (f"Embedding dimension {embed_dim} must be divisible by number of heads {num_heads}")
+
+        # Reinhard Compression
+        self.compression = ReinhardCompression(range=64.0, midpoint=32.0)
+
+        # Conv1d layer
+        self.conv_layer = nn.Conv1d(
+            input_channels,
+            conv_output_channels,
+            kernel_size=kernel_width,
+            stride=stride,
+        )
+
+        # ReLU
+        self.relu = nn.ReLU()
+
+        # Dropout
+        self.dropout = nn.Dropout(p=0.1)
+
+        # Layer normalization
+        self.post_conv_layer_norm = nn.RMSNorm(normalized_shape=conv_output_channels)
+
+        # Transformer Encoder
+        encoder_layer = TransformerEncoderLayer(
+            d_model=embed_dim,
+            n_head=num_heads,
+            dim_feedforward= int(embed_dim * mlp_ratio),
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # Layer normalization
+        self.norm = nn.RMSNorm(normalized_shape=embed_dim)
+
+        # Feedforward projection layer
+        self.projection = nn.Linear(embed_dim, output_channels)
+
+    def _make_causal_mask(self, seq_len: int) -> torch.Tensor:
+        # mask[i, j] = 0.0 for j <= i (allowed),
+        #           = -inf for j > i (masked)
+        return torch.triu(
+            torch.full((seq_len, seq_len), float("-inf")),
+            diagonal=1
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the network.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            Input tensor of shape (batch_size, input_channels, sequence_length)
+
+        Returns
+        -------
+        output : torch.Tensor
+            - Output tensor of shape (batch_size, num_gestures, sequence_length)
+        """
+
+        # Reinhard Compression
+        x = self.compression(inputs)
+
+        # Conv1d layer
+        x = self.conv_layer(x)
+
+        # ReLU
+        x = self.relu(x)
+
+        # Dropout
+        x = self.dropout(x)
+
+        # Layer normalization
+        # (batch_size, conv_output_channels, sequence_length)
+        # -> (batch_size, sequence_length, conv_output_channels)
+        x = x.transpose(1, 2)
+        x = self.post_conv_layer_norm(x)
+
+        seq_len = x.size(1)
+        causal_mask = self._make_causal_mask(seq_len).to(x.device)
+
+        # Stacked Transformer layers
+        x = self.transformer(x, mask=causal_mask, is_causal=True)
+
+        # Layer normalization
+        x = self.norm(x)
 
         # Feedforward projection layer
         x = self.projection(x)
