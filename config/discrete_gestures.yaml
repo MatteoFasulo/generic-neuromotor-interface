@@ -5,13 +5,14 @@ defaults:
   - lightning_module: discrete_gestures_module
 
 # Data settings
-data_location: ~/emg_data
+data_location: /capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/discrete_gestures/
 task: discrete_gestures
 
 # Train settings
 seed: 0
 train: True # Whether to run training
 eval: True # Whether to run evaluation on validation and test splits
+pretrained_checkpoint: /capstor/scratch/cscs/mfasulo/checkpoints/pretraining/20@rope@rmsnorm/20@rope@rmsnorm-epoch=20-val_loss=0.0140.ckpt
 
 # Number of nodes to train in DDP (1 node = 1 machine (e.g. G4))
 # So 2 nodes ==> 2xG4 ==> 2x8 GPUs ==> 16 GPUs
@@ -19,7 +20,7 @@ num_nodes: 1
 
 trainer:
   max_epochs: 250
-  strategy: ddp
+  strategy: ddp_find_unused_parameters_false
   accelerator: auto
 
 # Callback settings
