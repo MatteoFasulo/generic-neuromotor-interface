@@ -6,7 +6,7 @@ optimizer:
   _partial_: true
 
 network:
-  _target_: generic_neuromotor_interface.networks.DiscreteGesturesArchitecture
+  _target_: generic_neuromotor_interface.networks.TransformerDiscreteGesturesArchitecture
   output_channels: 9
 learning_rate: 5e-4
 lr_scheduler_milestones: [25]
