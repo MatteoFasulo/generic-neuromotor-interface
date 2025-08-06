@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 
 from typing import Any
 
+import torch
 import hydra
 import pytorch_lightning as pl
 import torch.distributed as dist
@@ -18,6 +19,41 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 
+torch.set_float32_matmul_precision('high')
+
+def load_pretrained_with_filtering(model, pretrained_path, key_prefix_to_match="blocks"):
+    ckpt = torch.load(pretrained_path, map_location="cpu")
+    pre_sd = ckpt.get("state_dict", ckpt)
+    tgt_sd = model.state_dict()
+
+    copied, dropped = [], []
+
+    for raw_key, raw_val in pre_sd.items():
+        # strip any "module."/"model."
+        key = raw_key
+        for pfx in ("module.", "model."):
+            if key.startswith(pfx):
+                key = key[len(pfx) :]
+
+        # remap ViT "blocks.{i}" to "transformer.layers.{i}"
+        key = key.replace("blocks.", "transformer.layers.")
+
+        # remap "attn" to "self_attn" so it matches the registered submodule
+        key = key.replace(".attn.", ".self_attn.")
+
+        # copy if name+shape match
+        if key in tgt_sd and raw_val.shape == tgt_sd[key].shape:
+            tgt_sd[key].copy_(raw_val)
+            copied.append(key)
+        else:
+            dropped.append(raw_key)
+
+    print(f"Copied {len(copied)} parameter(s) into the model.")
+    if dropped:
+        print(f"Dropped {len(dropped)} pretrained param(s) (name/shape mismatch):")
+        for k in dropped:
+            print(f"– {k}")
+    return tgt_sd
 
 def train(
     config: DictConfig,
@@ -39,6 +75,18 @@ def train(
 
     logger.info("Instantiating LightningModule")
     module = instantiate(config.lightning_module, _convert_="all")
+    print(f"Module: {module}")
+
+    # Load pre-trained weights if specified
+    if config.get("pretrained_checkpoint"):
+        checkpoint_path = config.pretrained_checkpoint
+        logger.info(f"Loading weights from checkpoint: {checkpoint_path}")
+        state_dict = load_pretrained_with_filtering(
+            module.network,
+            checkpoint_path,
+        )
+        module.network.load_state_dict(state_dict, strict=True)
+        print(f"Loaded pre-trained weights from {checkpoint_path}")
 
     logger.info("Instantiating LightningDataModule")
     datamodule = instantiate(config.data_module, _convert_="all")
