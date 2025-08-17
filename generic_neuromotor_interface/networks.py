@@ -315,7 +315,10 @@ class RoPEAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.rope = RotaryPositionalEmbeddings(dim=self.hd, max_seq_len=65_536, base=10_000)
+        rope_kwargs = {"dim": self.hd, "base": 10_000}
+        if max_seq_len is not None:
+            rope_kwargs["max_seq_len"] = max_seq_len
+        self.rope = RotaryPositionalEmbeddings(**rope_kwargs)
 
     def forward(self, x, attn_mask=None):
         B, N, D = x.shape  # [batch_size, total_number_tokens, embedding_dimension]
