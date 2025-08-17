@@ -304,6 +304,7 @@ class RoPEAttention(nn.Module):
         attn_drop=0.1,
         proj_drop=0.1,
         norm_layer: nn.Module = nn.LayerNorm,
+        max_seq_len: Optional[int] = None,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
