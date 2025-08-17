@@ -344,7 +344,7 @@ class RoPEAttention(nn.Module):
             dropout_p=self.attn_drop if self.training else 0.,
         )
 
-        x = x.transpose(2, 1).reshape(B, N, D)
+        x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         x = self.proj_drop(x)
 
