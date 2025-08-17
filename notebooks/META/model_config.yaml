@@ -1,0 +1,58 @@
+callbacks:
+-   _target_: pytorch_lightning.callbacks.LearningRateMonitor
+-   _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    mode: max
+    monitor: val_accuracy
+    save_last: true
+    verbose: true
+data_location: ~/emg_data
+data_module:
+    _target_: generic_neuromotor_interface.data_module.WindowedEmgDataModule
+    batch_size: 64
+    data_location: ~/emg_data
+    data_split:
+        _target_: generic_neuromotor_interface.data.DataSplit.from_csv
+        csv_filename: ~/emg_data/discrete_gestures_corpus.csv
+        pool_test_partitions: true
+    emg_augmentation:
+        _target_: generic_neuromotor_interface.augmentation.RotationAugmentation
+        rotation: 2
+    num_workers: 0
+    stride: 16000
+    transform:
+        _target_: generic_neuromotor_interface.transforms.DiscreteGesturesTransform
+        pulse_window:
+        - 0.08
+        - 0.12
+    window_length: 16000
+download_subset: false
+eval: false
+lightning_module:
+    _target_: generic_neuromotor_interface.lightning.DiscreteGesturesModule
+    gradient_clip_val: 0.5
+    learning_rate: 0.0005
+    lr_scheduler_factor: 0.5
+    lr_scheduler_milestones:
+    - 25
+    network:
+        _target_: generic_neuromotor_interface.networks.DiscreteGesturesArchitecture
+        output_channels: 9
+    optimizer:
+        _partial_: true
+        _target_: torch.optim.Adam
+        lr: 0.0001
+    warmup_end_factor: 1
+    warmup_start_factor: 0.001
+    warmup_total_epochs: 5
+local: false
+monitor_metric: val_accuracy
+monitor_mode: max
+name: discrete-gestures-train-dag
+num_nodes: 1
+seed: 0
+task: discrete_gestures
+train: true
+trainer:
+    accelerator: auto
+    max_epochs: 250
+    strategy: ddp

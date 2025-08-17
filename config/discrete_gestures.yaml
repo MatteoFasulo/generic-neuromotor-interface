@@ -12,7 +12,7 @@ task: discrete_gestures
 seed: 0
 train: True # Whether to run training
 eval: True # Whether to run evaluation on validation and test splits
-pretrained_checkpoint: /capstor/scratch/cscs/mfasulo/checkpoints/pretraining/20@rope@rmsnorm/20@rope@rmsnorm-epoch=20-val_loss=0.0140.ckpt
+pretrained_checkpoint: /capstor/scratch/cscs/mfasulo/checkpoints/pretraining/20@rope@gelu/20@rope@gelu-epoch=49-val_loss=0.0091.ckpt
 
 # Number of nodes to train in DDP (1 node = 1 machine (e.g. G4))
 # So 2 nodes ==> 2xG4 ==> 2x8 GPUs ==> 16 GPUs

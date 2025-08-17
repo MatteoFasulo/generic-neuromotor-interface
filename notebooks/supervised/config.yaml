@@ -1,0 +1,55 @@
+data_location: /capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/discrete_gestures/
+task: discrete_gestures
+seed: 0
+train: true
+eval: true
+num_nodes: 1
+trainer:
+  max_epochs: 250
+  strategy: ddp_find_unused_parameters_false
+  accelerator: auto
+monitor_metric: val_accuracy
+monitor_mode: max
+callbacks:
+- _target_: pytorch_lightning.callbacks.LearningRateMonitor
+- _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  monitor: ${monitor_metric}
+  mode: ${monitor_mode}
+  save_last: true
+  verbose: true
+data_module:
+  _target_: generic_neuromotor_interface.data_module.WindowedEmgDataModule
+  window_length: 16000
+  stride: 16000
+  batch_size: 64
+  num_workers: 0
+  transform:
+    _target_: generic_neuromotor_interface.transforms.DiscreteGesturesTransform
+    pulse_window:
+    - 0.08
+    - 0.12
+  data_location: ${data_location}
+  emg_augmentation:
+    _target_: generic_neuromotor_interface.augmentation.RotationAugmentation
+    rotation: 2
+  data_split:
+    _target_: generic_neuromotor_interface.data.DataSplit.from_csv
+    csv_filename: ${data_location}/discrete_gestures_corpus.csv
+    pool_test_partitions: true
+lightning_module:
+  _target_: generic_neuromotor_interface.lightning.DiscreteGesturesModule
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.0001
+    _partial_: true
+  network:
+    _target_: generic_neuromotor_interface.networks.TransformerDiscreteGesturesArchitecture
+    output_channels: 9
+  learning_rate: 0.0005
+  lr_scheduler_milestones:
+  - 25
+  lr_scheduler_factor: 0.5
+  warmup_start_factor: 0.001
+  warmup_end_factor: 1.0
+  warmup_total_epochs: 5
+  gradient_clip_val: 0.5
