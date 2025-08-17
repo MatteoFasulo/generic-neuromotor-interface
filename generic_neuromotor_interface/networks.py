@@ -12,8 +12,8 @@ import torch
 import torch.nn.functional as F
 from omegaconf import ListConfig
 from torch import nn
-from timm.layers import Mlp, SwiGLU
 
+from timm.layers import Mlp, trunc_normal_
 
 class Permute(nn.Module):
     """Permute the dimensions of the input tensor.
@@ -204,7 +204,7 @@ class RotaryPositionalEmbeddings(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_seq_len: int = 65536,
+        max_seq_len: int = 4096,
         base: int = 10_000,
     ) -> None:
         super().__init__()
@@ -221,7 +221,7 @@ class RotaryPositionalEmbeddings(nn.Module):
         self.register_buffer("theta", theta, persistent=False)
         self.build_rope_cache(self.max_seq_len)
 
-    def build_rope_cache(self, max_seq_len: int = 65536) -> None:
+    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
         # Create position indexes `[0, 1, ..., max_seq_len - 1]`
         seq_idx = torch.arange(
             max_seq_len, dtype=self.theta.dtype, device=self.theta.device
@@ -291,84 +291,99 @@ class RotaryPositionalEmbeddings(nn.Module):
         x_out = x_out.flatten(3)
         return x_out.type_as(x)
 
-class MHA(nn.Module):
+class RoPEAttention(nn.Module):
+    """
+    Multi Head Attention with Rotary Position Embedding (RoPE) applied to the Q and K tensors.
+    Fused Scaled Dot Product Attention is used.
+    """
     def __init__(
-        self, 
-        d_model, 
-        n_head,
-        dropout=0.1, 
-        batch_first=True,
-        qkv_bias: bool = True,
-        qk_norm: bool = True,
-        norm_layer: nn.Module = nn.RMSNorm,
+        self,
+        dim: int,
+        num_heads=3,
+        qkv_bias=True,
+        attn_drop=0.1,
+        proj_drop=0.1,
+        norm_layer: nn.Module = nn.LayerNorm,
     ):
         super().__init__()
-        assert d_model % n_head == 0, 'd_model should be divisible by n_head'
-        self.num_heads = n_head
-        self.head_dim = d_model // n_head
-        self.batch_first = batch_first
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads, self.dim = num_heads, dim
+        self.hd = dim // num_heads
 
-        self.qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj = nn.Linear(d_model, d_model)
-        self.proj_drop = nn.Dropout(dropout)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = attn_drop
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        self.rope = RotaryPositionalEmbeddings(dim=self.head_dim)
+        rope_kwargs = {"dim": self.hd, "base": 10_000}
+        if max_seq_len is not None:
+            rope_kwargs["max_seq_len"] = max_seq_len
+        self.rope = RotaryPositionalEmbeddings(**rope_kwargs)
 
-    def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
-        B, N, D = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+    def forward(self, x, attn_mask=None):
+        B, N, D = x.shape  # [batch_size, total_number_tokens, embedding_dimension]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
 
-        # [B, H, N, h_d] to [b, s, n_h, h_d]
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-
-        # Apply RoPE
+        # Apply RoPE to q and k
+        # q/k shape: [B, num_heads, N, head_dim]
+        q = q.permute(0, 2, 1, 3) # [B, N, num_heads, head_dim]
+        k = k.permute(0, 2, 1, 3) # [B, N, num_heads, head_dim]
+        
         q = self.rope(q)
         k = self.rope(k)
 
-        # Permute back for scaled_dot_product_attention
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
+        q = q.permute(0, 2, 1, 3)  # [B, num_heads, N, head_dim]
+        k = k.permute(0, 2, 1, 3)  # [B, num_heads, N, head_dim]
 
         x = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask, 
-            dropout_p=self.attn_drop.p if self.training else 0.,
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop if self.training else 0.,
         )
 
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         x = self.proj_drop(x)
+
         return x
 
-class TransformerEncoderLayer(nn.Module):
+class CustomAttentionBlock(nn.Module):
     def __init__(
-        self, 
-        d_model, 
-        n_head, 
-        dim_feedforward, 
-        dropout, 
-        batch_first=True,
-        mlp_layer: nn.Module = SwiGLU,
-    ):
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_drop: float = 0.1,
+        attn_drop: float = 0.1,
+        act_layer: nn.Module = nn.GELU,
+        norm_layer: nn.Module = nn.LayerNorm,
+    ) -> None:
         super().__init__()
-        self.self_attn = MHA(d_model, n_head, dropout, batch_first=batch_first)
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.mlp = mlp_layer(
-            in_features=d_model,
-            hidden_features=dim_feedforward,
-            drop=dropout,
+        self.attn = RoPEAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
         )
+        self.norm1 = norm_layer(dim)
+        self.dropout1 = nn.Dropout(proj_drop)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            out_features=dim,
+            drop=proj_drop,
+            act_layer=act_layer,
+        )
+        self.norm2 = norm_layer(dim)
 
-    def forward(self, x: torch.Tensor, src_mask: Optional[torch.Tensor] = None, src_key_padding_mask: Optional[torch.Tensor] = None, is_causal: bool = False) -> torch.Tensor:
-        x = x + self.dropout1(self.self_attn(self.norm1(x), attn_mask=src_mask))
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.dropout1(self.attn(self.norm1(x), attn_mask))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -398,8 +413,13 @@ class TransformerDiscreteGesturesArchitecture(nn.Module):
         stride: int = 10,
         embed_dim: int = 192,
         num_layers: int = 8,
-        num_heads: int = 12,
+        num_heads: int = 3,
         mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.1,
+        proj_drop: float = 0.1,
+        act_layer: nn.Module = nn.GELU,
+        norm_layer: nn.Module = nn.LayerNorm,
         output_channels: int = 9,
     ) -> None:
         super().__init__()
@@ -424,30 +444,50 @@ class TransformerDiscreteGesturesArchitecture(nn.Module):
             stride=stride,
         )
 
-        # ReLU
-        self.relu = nn.ReLU()
+        # GELU
+        self.gelu = act_layer()
 
         # Dropout
         self.dropout = nn.Dropout(p=0.1)
 
         # Layer normalization
-        self.post_conv_layer_norm = nn.RMSNorm(normalized_shape=conv_output_channels)
+        self.post_conv_layer_norm = norm_layer(normalized_shape=conv_output_channels)
 
         # Transformer Encoder
-        encoder_layer = TransformerEncoderLayer(
-            d_model=embed_dim,
-            n_head=num_heads,
-            dim_feedforward= int(embed_dim * mlp_ratio),
-            dropout=0.1,
-            batch_first=True,
+        self.blocks = nn.ModuleList(
+            [
+                CustomAttentionBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    act_layer=act_layer,
+                    norm_layer=norm_layer,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Layer normalization
-        self.norm = nn.RMSNorm(normalized_shape=embed_dim)
+        self.norm = norm_layer(normalized_shape=embed_dim)
 
         # Feedforward projection layer
         self.projection = nn.Linear(embed_dim, output_channels)
+        # ----------------------------------------------
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Initializes the model weights."""
+        # Encodings Initializations code taken from the LaBraM paper
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def _make_causal_mask(self, seq_len: int) -> torch.Tensor:
         # mask[i, j] = 0.0 for j <= i (allowed),
@@ -477,8 +517,8 @@ class TransformerDiscreteGesturesArchitecture(nn.Module):
         # Conv1d layer
         x = self.conv_layer(x)
 
-        # ReLU
-        x = self.relu(x)
+        # GELU
+        x = self.gelu(x)
 
         # Dropout
         x = self.dropout(x)
@@ -491,9 +531,9 @@ class TransformerDiscreteGesturesArchitecture(nn.Module):
 
         seq_len = x.size(1)
         causal_mask = self._make_causal_mask(seq_len).to(x.device)
-
-        # Stacked Transformer layers
-        x = self.transformer(x, mask=causal_mask, is_causal=True)
+        # Transformer layers
+        for block in self.blocks:
+            x = block(x, causal_mask)
 
         # Layer normalization
         x = self.norm(x)
