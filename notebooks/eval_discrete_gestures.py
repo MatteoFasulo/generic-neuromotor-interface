@@ -80,8 +80,6 @@ def get_logits(model, emg_sample, freq=2_000, device="cuda"):
 
 
 if __name__ == "__main__":
-    #torch.backends.cudnn.enabled = False
-
     parser = argparse.ArgumentParser(description="Evaluate discrete gestures model.")
     parser.add_argument("--data_dir", type=str, default="/capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/discrete_gestures/", help="Path to EMG data directory.")
     parser.add_argument("--model_ckpt", type=str, required=True, help="Path to model checkpoint.")
@@ -111,9 +109,10 @@ if __name__ == "__main__":
     model = instantiate(config.lightning_module)
     model = model.load_from_checkpoint(
         MODEL_CKPT,
-        map_location=torch.device("cpu")
+        map_location=torch.device("cpu"),
+        strict=True
     )
-    
+
     # Update DataModule config with data path
     config["data_module"]["data_location"] = os.path.expanduser(EMG_DATA_DIR)
     if "from_csv" in config["data_module"]["data_split"]["_target_"]:
@@ -277,15 +276,3 @@ if __name__ == "__main__":
 
         cler = compute_cler(final_preds, final_times, final_prompts)
         print(f"CLER on the entire test set: {cler}")
-
-
-# Meta (LSTM) - full sequence
-# 0.1819 CLER
-
-# Meta (LSTM) - sliding window
-# 0.1596 CLER
-# python notebooks/eval_discrete_gestures.py --model_ckpt /capstor/scratch/cscs/mfasulo/checkpoints/META/model_checkpoint.ckpt --config_path /capstor/scratch/cscs/mfasulo/checkpoints/META/model_config.yaml
-
-# EMG-Transformer - sliding window
-# 0.1599 CLER
-# python notebooks/eval_discrete_gestures.py --model_ckpt logs/2025-08-04/11-39-22/lightning_logs/version_1386059/checkpoints/epoch\=111-step\=6160.ckpt --config_path logs/2025-08-04/11-39-22/hydra_configs/config.yaml
