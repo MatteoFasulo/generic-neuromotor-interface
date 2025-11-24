@@ -5,14 +5,14 @@ defaults:
   - lightning_module: discrete_gestures_module
 
 # Data settings
-data_location: /capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/discrete_gestures/
+data_location: /usr/scratch2/sassauna2/msc25f18/datasets/generic_neuromotor_interface
 task: discrete_gestures
 
 # Train settings
-seed: 0
+seed: 42
 train: True # Whether to run training
 eval: True # Whether to run evaluation on validation and test splits
-pretrained_checkpoint: /capstor/scratch/cscs/mfasulo/checkpoints/pretraining/20@rope@gelu/20@rope@gelu-epoch=49-val_loss=0.0091.ckpt
+pretrained_checkpoint: /usr/scratch2/sassauna2/msc25f18/checkpoints/pretraining/20@rope@gelu/20@rope@gelu-epoch=49-val_loss=0.0091.ckpt
 
 # Number of nodes to train in DDP (1 node = 1 machine (e.g. G4))
 # So 2 nodes ==> 2xG4 ==> 2x8 GPUs ==> 16 GPUs
@@ -33,6 +33,11 @@ callbacks:
     monitor: ${monitor_metric}
     mode: ${monitor_mode}
     save_last: True
+    verbose: True
+  - _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: ${monitor_metric}
+    mode: ${monitor_mode}
+    patience: 30
     verbose: True
 
 # Customize hydra directory outputs

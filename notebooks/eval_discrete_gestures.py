@@ -1,25 +1,22 @@
-import os
 import argparse
-
-from tqdm import tqdm
+import os
 
 import numpy as np
 import pandas as pd
-
-import torch
-from pytorch_lightning import Trainer
-
-from hydra import initialize, compose
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
-
-from matplotlib import pyplot as plt
 import seaborn as sns
+import torch
+from hydra.utils import instantiate
+from matplotlib import pyplot as plt
+from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from generic_neuromotor_interface.cler import GestureType, compute_cler
 from generic_neuromotor_interface.data import make_dataset
 
-def merge_overlapping_logits_by_time(logits_list, num_classes, output_seq_len, output_step):
+
+def merge_overlapping_logits_by_time(
+    logits_list, num_classes, output_seq_len, output_step
+):
     """
     Merges a list of 2D logits from overlapping windows into a single 2D tensor,
     assuming the input tensor shape is (num_classes, output_seq_len).
@@ -49,21 +46,22 @@ def merge_overlapping_logits_by_time(logits_list, num_classes, output_seq_len, o
     counts[counts == 0] = 1
     return merged_logits / counts
 
+
 def get_logits(model, emg_sample, freq=2_000, device="cuda"):
     """
     Run forward pass on a single EMG sample using sliding window inference.
     """
     W = 8 * freq  # window length in samples
-    S = W // 4 # 25% overlap
+    S = W // 4  # 25% overlap
 
     logits_list = []
     C, T = emg_sample.shape
     with torch.no_grad():
         for i in range(0, T - W + 1, S):
-            emg_window = emg_sample[:, i:i+W]
+            emg_window = emg_sample[:, i : i + W]
             logits = model(emg_window.unsqueeze(0).contiguous().to(device))
             logits_list.append(logits[0].cpu())
-    
+
     # Now we have several logits tensors, each of shape (num_classes, output_seq_len)
     # they need to be merged into a single tensor which in theory should be close to the
     # one obtained with a single forward pass on the entire sequence.
@@ -81,10 +79,26 @@ def get_logits(model, emg_sample, freq=2_000, device="cuda"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate discrete gestures model.")
-    parser.add_argument("--data_dir", type=str, default="/capstor/scratch/cscs/mfasulo/datasets/generic-neuromotor-interface/discrete_gestures/", help="Path to EMG data directory.")
-    parser.add_argument("--model_ckpt", type=str, required=True, help="Path to model checkpoint.")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to model configuration file.")
-    parser.add_argument("--test_one_sample", action="store_true", help="If set, test one sample from the dataset.")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="/usr/scratch2/sassauna2/msc25f18/datasets/generic_neuromotor_interface/",
+        help="Path to EMG data directory.",
+    )
+    parser.add_argument(
+        "--model_ckpt", type=str, required=True, help="Path to model checkpoint."
+    )
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        required=True,
+        help="Path to model configuration file.",
+    )
+    parser.add_argument(
+        "--test_one_sample",
+        action="store_true",
+        help="If set, test one sample from the dataset.",
+    )
     args = parser.parse_args()
 
     TASK_NAME = "discrete_gestures"
@@ -108,17 +122,14 @@ if __name__ == "__main__":
 
     model = instantiate(config.lightning_module)
     model = model.load_from_checkpoint(
-        MODEL_CKPT,
-        map_location=torch.device("cpu"),
-        strict=True
+        MODEL_CKPT, map_location=torch.device("cpu"), strict=True
     )
 
     # Update DataModule config with data path
     config["data_module"]["data_location"] = os.path.expanduser(EMG_DATA_DIR)
     if "from_csv" in config["data_module"]["data_split"]["_target_"]:
         config["data_module"]["data_split"]["csv_filename"] = os.path.join(
-            os.path.expanduser(EMG_DATA_DIR),
-            f"{TASK_NAME}_corpus.csv"
+            os.path.expanduser(EMG_DATA_DIR), f"{TASK_NAME}_corpus.csv"
         )
 
     datamodule = instantiate(config["data_module"])
@@ -149,9 +160,9 @@ if __name__ == "__main__":
 
         probs = torch.nn.Sigmoid()(logits)
 
-        prob_times = emg_times[model.network.left_context::model.network.stride]
+        prob_times = emg_times[model.network.left_context :: model.network.stride]
         # The length of prob_times must match the number of time steps in probs (dim 1)
-        prob_times = prob_times[:probs.shape[1]]
+        prob_times = prob_times[: probs.shape[1]]
 
         cler = compute_cler(probs, prob_times, labels)
         print("CLER on this dataset:", cler)
@@ -184,7 +195,7 @@ if __name__ == "__main__":
                 prob_times - t0,
                 probs[prob_index] + prob_index,
                 linewidth=1,
-                label=gesture.name
+                label=gesture.name,
             )
         ax.set_yticks([])
 
@@ -197,7 +208,7 @@ if __name__ == "__main__":
             loc="upper left",
             ncols=1,
             bbox_to_anchor=(1.0, 1.0),
-            frameon=False
+            frameon=False,
         )
         ax.set_xlim([352, 357])
 
@@ -222,7 +233,7 @@ if __name__ == "__main__":
                     gesture_name,
                     rotation="vertical",
                     va="top",
-                    ha="left"
+                    ha="left",
                 )
 
         if labels_in_window:
@@ -241,7 +252,9 @@ if __name__ == "__main__":
         print("Figure saved!")
 
     else:
-        print("Testing on all samples from the dataset with sliding window inference...")
+        print(
+            "Testing on all samples from the dataset with sliding window inference..."
+        )
 
         model.eval()
         model.to(DEVICE)
@@ -263,7 +276,7 @@ if __name__ == "__main__":
             preds = torch.nn.Sigmoid()(logits)
             preds = preds.squeeze(0).detach().cpu().numpy()
             times = times[model.network.left_context :: model.network.stride]
-            times = times[:preds.shape[1]]
+            times = times[: preds.shape[1]]
 
             all_preds.append(preds)
             all_times.append(times)

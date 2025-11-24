@@ -7,19 +7,19 @@
 import logging
 import pprint
 from collections.abc import Callable, Sequence
-
 from typing import Any
 
-import torch
 import hydra
 import pytorch_lightning as pl
+import torch
 import torch.distributed as dist
-
+import torchprofile
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
+
 
 def train(
     config: DictConfig,
@@ -47,9 +47,25 @@ def train(
     if config.get("pretrained_checkpoint"):
         checkpoint_path = config.pretrained_checkpoint
         logger.info(f"Loading weights from checkpoint: {checkpoint_path}")
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
-        state_dict = {k.replace('model.','') if k.startswith('model.') else k: v for k, v in state_dict.items()}
+        state_dict = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )["state_dict"]
+        state_dict = {
+            k.replace("model.", "") if k.startswith("model.") else k: v
+            for k, v in state_dict.items()
+        }
         module.network.load_state_dict(state_dict, strict=False)
+
+    # FLOPs
+    macs = torchprofile.profile_macs(
+        module,
+        torch.randn(
+            1,
+            16,  # num_emg_channels (https://www.nature.com/articles/s41586-025-09255-w)
+            config.data_module.window_length,
+        ),
+    )
+    logger.info(f"FLOPs: {macs / 1e9:.4f} G")
 
     logger.info("Instantiating LightningDataModule")
     datamodule = instantiate(config.data_module, _convert_="all")
